@@ -12,3 +12,6 @@ wandb*
 
 #pycache
 __pycache__
+
+# build files
+build/
