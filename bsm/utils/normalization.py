@@ -54,6 +54,13 @@ class Normalizer:
         assert datum.ndim == 1
         return (datum - stats.mean) / stats.std
 
+    def _normalize_y(
+        self, y: jnp.ndarray, stats: Stats, eps: float = 1e-8
+    ) -> jnp.ndarray:
+        y_normalized = (y - stats.mean) / (stats.std + eps)
+        assert y_normalized.shape == y.shape
+        return y_normalized
+
     @partial(jax.jit, static_argnums=0)
     def normalize_std(self, datum: chex.Array, stats: Stats) -> chex.Array:
         assert datum.ndim == 1
