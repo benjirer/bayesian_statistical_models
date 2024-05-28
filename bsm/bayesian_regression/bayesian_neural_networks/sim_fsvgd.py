@@ -84,6 +84,16 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         f_prior_normalized = self.normalizer._normalize_y(f_prior, data_stats.outputs)
         return f_prior_normalized
 
+    def get_score_per_dim(self, fsamples, predictions, data_stacked, eps=1e-4):
+        # fsamples.ndim = 2, predictions.ndim = 1
+        f_mean = jnp.mean(fsamples, axis=0)
+        f_cov = tfp.stats.covariance(fsamples, sample_axis=0)
+        prior_gp_approx = tfd.MultivariateNormalFullCovariance(
+            loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
+        )
+        prior_logprob = jnp.sum(prior_gp_approx.log_prob(predictions))
+        return prior_logprob
+
     def prior_log_prob_gp_approx(
         self,
         predictions: jnp.ndarray,
@@ -95,18 +105,25 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
 
         # calculate prior
         f_samples = self.fsim_samples(data_stacked, key, data_stats)
-        f_mean = jnp.mean(f_samples, axis=0).T
-        f_cov = jnp.swapaxes(
-            tfp.stats.covariance(f_samples, sample_axis=0, event_axis=1), 0, -1
-        )
-        prior_gp_approx = tfd.MultivariateNormalFullCovariance(
-            loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
-        )
-        prior_logprob = jnp.sum(
-            prior_gp_approx.log_prob(predictions.swapaxes(-1, -2)), axis=(-2, -1)
-        )
 
-        return prior_logprob
+        # fsamples = [256, 48, 2], predictions = [48, 2]
+        log_prob_per_dim = jax.vmap(
+            self.get_score_per_dim, in_axes=(2, 1, None), out_axes=0
+        )(f_samples, predictions, data_stacked)
+        log_prob = log_prob_per_dim.mean(-1)
+
+        # f_mean = jnp.mean(f_samples, axis=0).T
+        # f_cov = jnp.swapaxes(
+        #     tfp.stats.covariance(f_samples, sample_axis=0, event_axis=1), 0, -1
+        # )
+        # prior_gp_approx = tfd.MultivariateNormalFullCovariance(
+        #     loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
+        # )
+        # prior_logprob = jnp.sum(
+        #     prior_gp_approx.log_prob(predictions.swapaxes(-1, -2)), axis=(-2, -1)
+        # )
+
+        return log_prob
 
     # def prior_log_prob(self, mu, data_stacked, key, data_stats):
     #     # predictions shape: (len(data_stacked), 2*output_dim)
@@ -130,19 +147,19 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         mu_inputs = mu[:, :input_till_idx, :]
         sigma_inputs = nn.softplus(sigma[:, :input_till_idx, :])
 
-        nll = jax.vmap(jax.vmap(self._nll), in_axes=(0, 0, None))(
+        nll = num_train_points * jax.vmap(jax.vmap(self._nll), in_axes=(0, 0, None))(
             mu_inputs, sigma_inputs, outputs
         )
 
-        # # calculate prior lof_prob for each particle
-        # # predictions shape: (num_particles, len(data_stacked), 2*output_dim)
-        # prior_logprob = vmap(
-        #     self.prior_log_prob, in_axes=(0, None, None, None)
-        # )(mu, data_stacked, key, data_stats)
+        # calculate prior lof_prob for each particle
+        # predictions shape: (num_particles, len(data_stacked), 2*output_dim)
+        prior_logprob = vmap(
+            self.prior_log_prob_gp_approx, in_axes=(0, None, None, None)
+        )(mu, data_stacked, key, data_stats)
 
-        prior_logprob = self.prior_log_prob_gp_approx(mu, data_stacked, key, data_stats)
+        # prior_logprob = self.prior_log_prob_gp_approx(mu, data_stacked, key, data_stats)
 
-        return nll.mean() - prior_logprob
+        return nll.mean() - 0 * prior_logprob.mean()
 
     def loss(
         self,
@@ -150,12 +167,13 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         inputs: chex.Array,
         outputs: chex.Array,
         data_stats: DataStats,
+        key: jax.random.PRNGKey = random.PRNGKey(0),
     ) -> [jax.Array, Dict]:
 
         # data points: input and measurement points
         input_till_idx = inputs.shape[0]
         measurement_points = self.domain.sample_uniformly(
-            key=random.PRNGKey(0), sample_shape=self.num_measurement_points
+            key=key, sample_shape=(self.num_measurement_points,)
         )
         # measurement_points = jnp.linspace(-5, 15, self.num_measurement_points).reshape(
         #     -1, 1
@@ -189,7 +207,7 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
             input_till_idx,
             target_outputs_norm,
             len(inputs),
-            random.PRNGKey(3),
+            key,
             data_stats,
         )
 
@@ -197,8 +215,9 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         mse = jnp.mean((mu_inputs - target_outputs_norm[None, ...]) ** 2)
 
         # calculate kernel, kernel derivative and kernal gradient
-        k = self.stein_kernel(mu)
-        k_x = self.stein_kernel_derivative(mu)
+        mu_copy = jax.lax.stop_gradient(mu)
+        k = self.stein_kernel(mu_copy)
+        k_x = self.stein_kernel_derivative(mu_copy)
         grad_k = jnp.mean(k_x, axis=0)
 
         # calculate surrogate loss (analog to FSVGD-Paper)
@@ -396,21 +415,23 @@ if __name__ == "__main__":
     test_simulator = True
     input_dim = 1
     output_dim = 2
+    sim = SinusoidsSim(input_size=input_dim, output_size=output_dim)
 
     noise_level = 0.1
-    d_l, d_u = 0, 10
+    d_l, d_u = -5, 5
     xs = jnp.linspace(d_l, d_u, 20).reshape(-1, 1)
-    ys = jnp.concatenate([jnp.sin(xs), jnp.cos(xs)], axis=1)
+    # ys = jnp.concatenate([jnp.sin(xs), jnp.cos(xs)], axis=1)
+    ys_co = sim.sample_function_vals(xs, num_samples=1, rng_key=key)
+    ys = jnp.squeeze(ys_co, axis=0)
+
     ys = ys * (1 + noise_level * random.normal(key=random.PRNGKey(0), shape=ys.shape))
     data_std = noise_level * jnp.ones(shape=(output_dim,))
 
     data = Data(inputs=xs, outputs=ys)
 
-    sim = SinusoidsSim(input_size=input_dim, output_size=output_dim)
-
     # if test_simulator:
     #     num_samples = 10
-    #     # x_test = sim.domain.sample_uniformly(key=key, sample_shape=(100,))
+    #     x_test = sim.domain.sample_uniformly(key=key, sample_shape=(100,))
     #     x_test = jnp.linspace(-3, 13, 1000).reshape(-1, 1)
 
     #     y_test = sim.sample_function_vals(x_test, num_samples=num_samples, rng_key=key)
@@ -456,7 +477,10 @@ if __name__ == "__main__":
     print(f"Training time: {time.time() - start_time:.2f} seconds")
 
     test_xs = jnp.linspace(-3, 13, 1000).reshape(-1, 1)
-    test_ys = jnp.concatenate([jnp.sin(test_xs), jnp.cos(test_xs)], axis=1)
+
+    # test_ys = jnp.concatenate([jnp.sin(test_xs), jnp.cos(test_xs)], axis=1)
+    test_ys_co = sim.sample_function_vals(test_xs, num_samples=1, rng_key=key)
+    test_ys = jnp.squeeze(test_ys_co, axis=0)
 
     test_ys_noisy = test_ys * (
         1 + noise_level * random.normal(key=random.PRNGKey(0), shape=test_ys.shape)
