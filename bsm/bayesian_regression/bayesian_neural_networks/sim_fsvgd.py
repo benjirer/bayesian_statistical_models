@@ -6,10 +6,13 @@ import chex
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 import matplotlib.pyplot as plt
 from jax import random, vmap
+from jax.scipy.stats import norm
 from jaxtyping import PyTree
 import tensorflow_probability.substrates.jax.distributions as tfd
+from tensorflow_probability.substrates import jax as tfp
 
 from bsm.bayesian_regression.bayesian_neural_networks.deterministic_ensembles import (
     DeterministicEnsemble,
@@ -67,6 +70,7 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         )
         self.likelihood_exponent = likelihood_exponent
         self.stein_kernel, self.stein_kernel_derivative = prepare_stein_kernel()
+        self.domain = self.function_simulator.domain
 
     def fsim_samples(
         self, x: jnp.ndarray, key: jax.random.PRNGKey, data_stats: DataStats
@@ -107,18 +111,18 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         self,
         predictions: jnp.ndarray,
         likelihood_std: jnp.ndarray,
-        y_batch: jnp.ndarray,
+        outputs: jnp.ndarray,
     ) -> jnp.ndarray:
         log_prob = tfd.MultivariateNormalDiag(
             loc=predictions, scale_diag=likelihood_std
-        ).log_prob(y_batch)
+        ).log_prob(outputs)
         return jnp.mean(log_prob, axis=-1).sum(axis=0)
 
     def neg_log_posterior(
         self,
         predictions: jnp.ndarray,
         x: jnp.ndarray,
-        y_batch: jnp.ndarray,
+        outputs: jnp.ndarray,
         num_train_points: Union[float, int],
         key: jax.random.PRNGKey,
         data_stats: DataStats,
@@ -126,7 +130,7 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         nll = (
             -num_train_points
             * self.likelihood_exponent
-            * self.log_likelihood(predictions, self.likelihood_std, y_batch)
+            * self.log_likelihood(predictions, self.likelihood_std, outputs)
         )
         prior_logprob = self.prior_log_prob_gp_approx(predictions, x, key, data_stats)
         neg_log_post = nll - prior_logprob
@@ -199,8 +203,8 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
         self,
         prior_h: float = 1.0,
         function_simulator: FunctionSimulator = SinusoidsSim(),
+        num_measurement_points: int = 16,
         num_f_samples: int = 64,
-        likelihood_std: Union[float, jnp.ndarray] = 0.2,
         likelihood_exponent: float = 1.0,
         *args,
         **kwargs,
@@ -208,29 +212,25 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
         super().__init__(*args, **kwargs)
         self.prior_h = prior_h
         self.function_simulator = function_simulator
+        self.num_measurement_points = num_measurement_points
         self.num_f_samples = num_f_samples
-        self.likelihood_std = (
-            jnp.array([likelihood_std] * self.output_dim)
-            if isinstance(likelihood_std, float) and self.output_dim > 1
-            else likelihood_std
-        )
         self.likelihood_exponent = likelihood_exponent
         self.stein_kernel, self.stein_kernel_derivative = prepare_stein_kernel()
+        self.domain = self.function_simulator.domain
 
     def fsim_samples(
-        self, x: jnp.ndarray, key: jax.random.PRNGKey, data_stats: DataStats
+        self, data_stacked: jnp.ndarray, key: jax.random.PRNGKey, data_stats: DataStats
     ) -> jnp.ndarray:
-
-        d_l, d_u = 0, 10
-        x = jnp.linspace(d_l, d_u, 10).reshape(-1, 1)
+        random_key, subkey = random.split(key)
 
         x_unnormalized = vmap(
             lambda xi: self.normalizer.denormalize(xi, data_stats.inputs)
-        )(x)
+        )(data_stacked)
 
         f_prior = self.function_simulator.sample_function_vals(
-            x=x_unnormalized, num_samples=self.num_f_samples, rng_key=key
+            x=x_unnormalized, num_samples=self.num_f_samples, rng_key=subkey
         )
+
         f_prior_normalized = vmap(
             lambda fi: vmap(self.normalizer.normalize, in_axes=(0, None))(
                 fi, data_stats.outputs
@@ -241,51 +241,69 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
     def prior_log_prob_gp_approx(
         self,
         predictions: jnp.ndarray,
-        x: jnp.ndarray,
+        data_stacked: jnp.ndarray,
         key: jax.random.PRNGKey,
         data_stats: DataStats,
         eps: float = 1e-4,
     ) -> jnp.ndarray:
-        # dont pass x
-        f_samples = self.fsim_samples(x, key, data_stats)
-        f_mean = jnp.mean(f_samples, axis=0)
-        f_cov = jnp.cov(
-            f_samples.reshape(-1, f_samples.shape[-1]), rowvar=False
-        ) + eps * jnp.eye(f_samples.shape[-1])
-        prior_gp_approx = tfd.MultivariateNormalFullCovariance(
-            loc=f_mean, covariance_matrix=f_cov
+
+        # calculate prior
+        f_samples = self.fsim_samples(data_stacked, key, data_stats)
+        f_mean = jnp.mean(f_samples, axis=0).T
+        f_cov = jnp.swapaxes(
+            tfp.stats.covariance(f_samples, sample_axis=0, event_axis=1), 0, -1
         )
-        prior_logprob = prior_gp_approx.log_prob(predictions)
+        prior_gp_approx = tfd.MultivariateNormalFullCovariance(
+            loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
+        )
+        prior_logprob = jnp.sum(prior_gp_approx.log_prob(predictions.swapaxes(-1, -2)))
+
         return prior_logprob
 
-    def log_likelihood(
+    def _neg_log_posterior(
         self,
         predictions: jnp.ndarray,
-        likelihood_std: jnp.ndarray,
-        y_batch: jnp.ndarray,
-    ) -> jnp.ndarray:
-        log_prob = tfd.MultivariateNormalDiag(
-            loc=predictions, scale_diag=likelihood_std
-        ).log_prob(y_batch)
-        return jnp.mean(log_prob, axis=-1).sum(axis=0)
-
-    def neg_log_posterior(
-        self,
-        predictions: jnp.ndarray,
-        x: jnp.ndarray,
-        y_batch: jnp.ndarray,
+        data_stacked: jnp.ndarray,
+        input_till_idx: int,
+        outputs: jnp.ndarray,
         num_train_points: Union[float, int],
         key: jax.random.PRNGKey,
         data_stats: DataStats,
     ):
-        nll = (
-            -num_train_points
-            * self.likelihood_exponent
-            * self.log_likelihood(predictions, self.likelihood_std, y_batch)
-        )
-        prior_logprob = self.prior_log_prob_gp_approx(predictions, x, key, data_stats)
-        neg_log_post = nll - prior_logprob
-        return jnp.mean(neg_log_post)
+        # calculate _neg_log_posterior for each particle
+        # predictions shape: (num_particles, len(data_stacked), 2*output_dim)
+
+        def _neg_log_posterior_single(predictions, data_stacked, key, data_stats):
+            # predictions shape: (len(data_stacked), 2*output_dim)
+
+            # split predictions
+            mu, log_sigma = jnp.split(predictions, 2, axis=-1)
+            sigma = nn.softplus(log_sigma)
+
+            # split pred_inputs
+            pred_inputs = predictions[:input_till_idx, :]
+            mu_inputs, log_sigma_inputs = jnp.split(pred_inputs, 2, axis=-1)
+            sigma_inputs = nn.softplus(log_sigma_inputs)
+
+            # calculate nll
+            nll = (
+                -num_train_points
+                * self.likelihood_exponent
+                * norm.logpdf(outputs, loc=mu_inputs, scale=sigma_inputs)
+            )
+
+            prior_logprob = self.prior_log_prob_gp_approx(
+                mu, data_stacked, key, data_stats
+            )
+
+            neg_log_post = nll.mean() - prior_logprob
+            return neg_log_post
+
+        neg_log_post_final = vmap(
+            _neg_log_posterior_single, in_axes=(0, None, None, None)
+        )(predictions, data_stacked, key, data_stats)
+
+        return jnp.mean(neg_log_post_final)
 
     def loss(
         self,
@@ -295,22 +313,32 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
         data_stats: DataStats,
     ) -> [jax.Array, Dict]:
 
+        # data points: input and measurement points
+        input_till_idx = inputs.shape[0]
+        measurement_points = self.domain.sample_uniformly(
+            key=random.PRNGKey(0), sample_shape=self.num_measurement_points
+        )
+        data_stacked = jnp.concatenate([inputs, measurement_points], axis=0)
+
         # adapt "apply_train" to output model
         def apply_fn(params: PyTree, x: jax.Array) -> jax.Array:
             x = self.normalizer.normalize(x, data_stats.inputs)
             out = self.model.apply({"params": params}, x)
             return out
 
-        # setup vmap: apply to params
+        # setup vmap
         apply_ensemble_one = vmap(apply_fn, in_axes=(0, None), out_axes=0)
-
-        # setup vmap: apply to inputs
         apply_ensemble = vmap(
             apply_ensemble_one, in_axes=(None, 0), out_axes=1, axis_name="batch"
         )
 
-        # apply vmaps to get predictions (model)
-        f_raw = apply_ensemble(vmapped_params, inputs)
+        # apply to get predictions
+        f_raw = apply_ensemble(vmapped_params, data_stacked)
+
+        # split predictions to seperate input and measurement points
+        # f_raw_inputs = apply_ensemble_one(vmapped_params, inputs)
+        f_raw_inputs = f_raw[:, :input_till_idx, :]
+        mu_inputs, log_sigma_inputs = jnp.split(f_raw_inputs, 2, axis=-1)
 
         # normalize target outputs
         target_outputs_norm = vmap(self.normalizer.normalize, in_axes=(0, None))(
@@ -319,13 +347,15 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
 
         def neg_log_likelihood(predictions, output):
             mu, log_sigma = jnp.split(predictions, 2, axis=-1)
-            sig = nn.softplus(log_sigma)
-            # pass sigma (use GP prior on log sigma)
-            # sig = nn.softplus(sig)
-            # sig = jnp.clip(sig, self.sig_min, self.sig_max)
             return (
-                self.neg_log_posterior(
-                    mu, inputs, output, len(inputs), random.PRNGKey(3), data_stats
+                self._neg_log_posterior(
+                    predictions,
+                    data_stacked,
+                    input_till_idx,
+                    output,
+                    len(inputs),
+                    random.PRNGKey(3),
+                    data_stats,
                 ),
                 mu,
             )
@@ -336,7 +366,7 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
         )(f_raw, target_outputs_norm)
 
         # calculate mse
-        mse = jnp.mean((mu - target_outputs_norm[None, ...]) ** 2)
+        mse = jnp.mean((mu_inputs - target_outputs_norm[None, ...]) ** 2)
 
         # calculate kernel, kernel derivative and kernal gradient
         k = self.stein_kernel(f_raw)
@@ -353,19 +383,40 @@ class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
 if __name__ == "__main__":
     key = random.PRNGKey(0)
     logging_wandb = False
+    test_simulator = True
     input_dim = 1
     output_dim = 2
 
     noise_level = 0.1
     d_l, d_u = 0, 10
-    xs = jnp.linspace(d_l, d_u, 10).reshape(-1, 1)
+    xs = jnp.linspace(d_l, d_u, 20).reshape(-1, 1)
     ys = jnp.concatenate([jnp.sin(xs), jnp.cos(xs)], axis=1)
     ys = ys * (1 + noise_level * random.normal(key=random.PRNGKey(0), shape=ys.shape))
     data_std = noise_level * jnp.ones(shape=(output_dim,))
 
     data = Data(inputs=xs, outputs=ys)
 
-    sim = SinusoidsSim(output_size=output_dim)
+    sim = SinusoidsSim(input_size=input_dim, output_size=output_dim)
+
+    if test_simulator:
+        num_samples = 10
+        # x_test = sim.domain.sample_uniformly(key=key, sample_shape=(100,))
+        x_test = jnp.linspace(-3, 13, 1000).reshape(-1, 1)
+
+        y_test = sim.sample_function_vals(x_test, num_samples=num_samples, rng_key=key)
+
+        fig, axs = plt.subplots(1, output_dim, figsize=(12, 6))
+
+        for i in range(num_samples):
+            for j in range(output_dim):
+                axs[j].plot(x_test, y_test[i, :, j], label=f"Sample {i+1}")
+
+        for ax in axs:
+            ax.legend()
+            ax.set_xlabel("x")
+            ax.set_ylabel("f(x)")
+
+        plt.savefig("sampled_functions.png")
 
     num_particles = 10
     model = ProbabilisticSimFSVGDEnsemble(
@@ -378,7 +429,7 @@ if __name__ == "__main__":
         output_stds=data_std,
         logging_wandb=logging_wandb,
         function_simulator=sim,
-        likelihood_std=0.05,
+        # likelihood_std=0.05,
     )
     model_state = model.init(model.key)
     start_time = time.time()
