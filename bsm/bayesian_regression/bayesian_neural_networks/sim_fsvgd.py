@@ -1,8 +1,9 @@
 import time
 from typing import Dict, Callable, Optional, Union
 import os
-
+from functools import partial
 import chex
+import optax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -11,8 +12,8 @@ import matplotlib.pyplot as plt
 from jax import random, vmap
 from jax.scipy.stats import norm
 from jaxtyping import PyTree
-import tensorflow_probability.substrates.jax.distributions as tfd
-from tensorflow_probability.substrates import jax as tfp
+from collections import OrderedDict
+from distrax import MultivariateNormalFullCovariance
 
 from bsm.bayesian_regression.bayesian_neural_networks.deterministic_ensembles import (
     DeterministicEnsemble,
@@ -20,35 +21,15 @@ from bsm.bayesian_regression.bayesian_neural_networks.deterministic_ensembles im
 from bsm.bayesian_regression.bayesian_neural_networks.probabilistic_ensembles import (
     ProbabilisticEnsemble,
 )
+from bsm.bayesian_regression.bayesian_neural_networks.bnn import BNNState, NO_EVAL_VALUE
 from bsm.utils.normalization import DataStats, Data
 from bsm.sims import FunctionSimulator
 from bsm.sims import SinusoidsSim
 import wandb
 
 
-def prepare_stein_kernel(h=0.2**2):
-    def k(x, y):
-        return jnp.exp(-jnp.sum((x - y) ** 2) / (2 * h))
 
-    v_k = vmap(k, in_axes=(0, None), out_axes=0)
-    m_k = vmap(v_k, in_axes=(None, 0), out_axes=1)
-
-    def kernel(fs):
-        kernel_matrix = m_k(fs, fs)
-        return kernel_matrix
-
-    k_x = jax.grad(k, argnums=0)
-
-    v_k_der = vmap(k_x, in_axes=(0, None), out_axes=0)
-    m_k_der = vmap(v_k_der, in_axes=(None, 0), out_axes=1)
-
-    def kernel_derivative(fs):
-        return m_k_der(fs, fs)
-
-    return kernel, kernel_derivative
-
-
-class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
+class SimPriorDeterministicEnsemble(DeterministicEnsemble):
     def __init__(
         self,
         prior_h: float = 1.0,
@@ -65,34 +46,53 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         self.num_measurement_points = num_measurement_points
         self.num_f_samples = num_f_samples
         self.likelihood_exponent = likelihood_exponent
-        self.stein_kernel, self.stein_kernel_derivative = prepare_stein_kernel()
         self.domain = self.function_simulator.domain
+
+    def eval_loss(self,
+                vmapped_params: chex.Array,
+                inputs: chex.Array,
+                outputs: chex.Array,
+                data_stats: DataStats) -> chex.Array:
+        apply_ensemble_one = vmap(self._apply_train, in_axes=(0, None, None), out_axes=0)
+        apply_ensemble = vmap(apply_ensemble_one, in_axes=(None, 0, None), out_axes=1, axis_name='batch')
+        predicted_outputs, predicted_stds = apply_ensemble(vmapped_params, inputs, data_stats)
+
+        target_outputs_norm = vmap(self.normalizer.normalize, in_axes=(0, None))(outputs, data_stats.outputs)
+        negative_log_likelihood = super()._neg_log_posterior(predicted_outputs, predicted_stds, target_outputs_norm)
+        mse = jnp.mean((predicted_outputs - target_outputs_norm[None, ...]) ** 2)
+        return negative_log_likelihood, mse
+
+    def evaluate_model(self,
+                       vmapped_params: PyTree,
+                       eval_data: Data,
+                       data_stats: DataStats) -> OrderedDict:
+        eval_nll, eval_mse = self.eval_loss(vmapped_params, eval_data.inputs,
+                                       eval_data.outputs, data_stats)
+        eval_stats = OrderedDict(eval_nll=eval_nll, eval_mse=eval_mse)
+        return eval_stats
 
     def fsim_samples(
         self, data_stacked: jnp.ndarray, key: jax.random.PRNGKey, data_stats: DataStats
     ) -> jnp.ndarray:
-        random_key, subkey = random.split(key)
-
-        x_unnormalized = vmap(
-            lambda xi: self.normalizer.denormalize(xi, data_stats.inputs)
-        )(data_stacked)
 
         f_prior = self.function_simulator.sample_function_vals(
-            x=x_unnormalized, num_samples=self.num_f_samples, rng_key=subkey
+            x=data_stacked, num_samples=self.num_f_samples, rng_key=key
         )
-
-        f_prior_normalized = self.normalizer._normalize_y(f_prior, data_stats.outputs)
+        # vmap over measurement points and then over samples
+        f_prior_normalized = jax.vmap(jax.vmap(lambda y: self.normalizer._normalize_y(y,
+                                                                                 data_stats.outputs)))(f_prior)
         return f_prior_normalized
 
-    def get_score_per_dim(self, fsamples, predictions, data_stacked, eps=1e-4):
+    def get_score_per_dim(self, fsamples, predictions, eps=1e-4):
         # fsamples.ndim = 2, predictions.ndim = 1
         f_mean = jnp.mean(fsamples, axis=0)
-        f_cov = tfp.stats.covariance(fsamples, sample_axis=0)
-        prior_gp_approx = tfd.MultivariateNormalFullCovariance(
-            loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
+        f_cov = jnp.cov(fsamples, rowvar=False, bias=True)
+        prior_gp_approx = MultivariateNormalFullCovariance(
+            loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(f_cov.shape[0])
         )
-        prior_logprob = jnp.sum(prior_gp_approx.log_prob(predictions))
-        return prior_logprob
+        # TODO: Normalization wrt the number of points in the prior helps in training.
+        #  -> Should check if this is generally necessary
+        return prior_gp_approx.log_prob(predictions) / (self.num_measurement_points + self.batch_size)
 
     def prior_log_prob_gp_approx(
         self,
@@ -105,61 +105,32 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
 
         # calculate prior
         f_samples = self.fsim_samples(data_stacked, key, data_stats)
-
-        # fsamples = [256, 48, 2], predictions = [48, 2]
+        # calculate log prob per dim
         log_prob_per_dim = jax.vmap(
-            self.get_score_per_dim, in_axes=(2, 1, None), out_axes=0
-        )(f_samples, predictions, data_stacked)
-        log_prob = log_prob_per_dim.mean(-1)
-
-        # f_mean = jnp.mean(f_samples, axis=0).T
-        # f_cov = jnp.swapaxes(
-        #     tfp.stats.covariance(f_samples, sample_axis=0, event_axis=1), 0, -1
-        # )
-        # prior_gp_approx = tfd.MultivariateNormalFullCovariance(
-        #     loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
-        # )
-        # prior_logprob = jnp.sum(
-        #     prior_gp_approx.log_prob(predictions.swapaxes(-1, -2)), axis=(-2, -1)
-        # )
-
+            self.get_score_per_dim, in_axes=(2, 1), out_axes=0
+        )(f_samples, predictions)
+        log_prob = log_prob_per_dim.sum(0)
         return log_prob
-
-    # def prior_log_prob(self, mu, data_stacked, key, data_stats):
-    #     # predictions shape: (len(data_stacked), 2*output_dim)
-    #     prior_logprob = self.prior_log_prob_gp_approx(mu, data_stacked, key, data_stats)
-    #     return prior_logprob
 
     def _neg_log_posterior(
         self,
         mu: jnp.ndarray,
         sigma: jnp.ndarray,
         data_stacked: jnp.ndarray,
-        input_till_idx: int,
         outputs: jnp.ndarray,
-        num_train_points: Union[float, int],
+        num_data_points: int,
         key: jax.random.PRNGKey,
         data_stats: DataStats,
     ):
 
-        # calculate nll for input data only
-        # split predictions
-        mu_inputs = mu[:, :input_till_idx, :]
-        sigma_inputs = nn.softplus(sigma[:, :input_till_idx, :])
+        mu_inputs = mu[:-self.num_measurement_points, :]
+        sigma_inputs = nn.softplus(sigma[:-self.num_measurement_points, :])
 
-        nll = num_train_points * jax.vmap(jax.vmap(self._nll), in_axes=(0, 0, None))(
-            mu_inputs, sigma_inputs, outputs
-        )
+        nll = jax.vmap(self._nll)(mu_inputs, sigma_inputs, outputs)
 
-        # calculate prior lof_prob for each particle
-        # predictions shape: (num_particles, len(data_stacked), 2*output_dim)
-        prior_logprob = vmap(
-            self.prior_log_prob_gp_approx, in_axes=(0, None, None, None)
-        )(mu, data_stacked, key, data_stats)
+        prior_logprob = self.prior_log_prob_gp_approx(mu, data_stacked, key, data_stats)
 
-        # prior_logprob = self.prior_log_prob_gp_approx(mu, data_stacked, key, data_stats)
-
-        return nll.mean() - 0 * prior_logprob.mean()
+        return self.likelihood_exponent * nll.mean() -  (1.0 / num_data_points) * prior_logprob.mean()
 
     def loss(
         self,
@@ -167,17 +138,13 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         inputs: chex.Array,
         outputs: chex.Array,
         data_stats: DataStats,
-        key: jax.random.PRNGKey = random.PRNGKey(0),
+        key: jax.random.PRNGKey,
+        num_data_points: int,
     ) -> [jax.Array, Dict]:
-
-        # data points: input and measurement points
-        input_till_idx = inputs.shape[0]
+        measurement_points_key, key = jax.random.split(key, 2)
         measurement_points = self.domain.sample_uniformly(
-            key=key, sample_shape=(self.num_measurement_points,)
+            key=measurement_points_key, sample_shape=(self.num_measurement_points,)
         )
-        # measurement_points = jnp.linspace(-5, 15, self.num_measurement_points).reshape(
-        #     -1, 1
-        # )
         data_stacked = jnp.concatenate([inputs, measurement_points], axis=0)
 
         # setup vmap
@@ -191,241 +158,124 @@ class DeterministicSimFSVGDEnsemble(DeterministicEnsemble):
         # apply to get predictions
         mu, sigma = apply_ensemble(vmapped_params, data_stacked, data_stats)
 
-        # split predictions to seperate input and measurement points
-        mu_inputs = mu[:, :input_till_idx, :]
 
         # normalize target outputs
         target_outputs_norm = vmap(self.normalizer.normalize, in_axes=(0, None))(
             outputs, data_stats.outputs
         )
 
-        # calculate nll and nll gradient of posterior
-        negative_log_posterior, grad_post = jax.value_and_grad(self._neg_log_posterior)(
+        # vmap over the ensemble axis
+        neg_log_posterior = jax.vmap(self._neg_log_posterior, in_axes=(0, 0, None, None, None, None, None))
+        negative_log_posterior = neg_log_posterior(
             mu,
             sigma,
             data_stacked,
-            input_till_idx,
             target_outputs_norm,
-            len(inputs),
+            num_data_points,
             key,
             data_stats,
         )
 
-        # calculate mse
-        mse = jnp.mean((mu_inputs - target_outputs_norm[None, ...]) ** 2)
-
-        # calculate kernel, kernel derivative and kernal gradient
-        mu_copy = jax.lax.stop_gradient(mu)
-        k = self.stein_kernel(mu_copy)
-        k_x = self.stein_kernel_derivative(mu_copy)
-        grad_k = jnp.mean(k_x, axis=0)
-
-        # calculate surrogate loss (analog to FSVGD-Paper)
-        surrogate_loss = jnp.sum(
-            mu * jax.lax.stop_gradient(jnp.einsum("ij,jkm", k, grad_post) - grad_k)
-        )
-        return surrogate_loss, mse
-
-
-class ProbabilisticSimFSVGDEnsemble(ProbabilisticEnsemble):
-    def __init__(
-        self,
-        prior_h: float = 1.0,
-        function_simulator: FunctionSimulator = SinusoidsSim(),
-        num_measurement_points: int = 16,
-        num_f_samples: int = 64,
-        likelihood_exponent: float = 1.0,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.prior_h = prior_h
-        self.function_simulator = function_simulator
-        self.num_measurement_points = num_measurement_points
-        self.num_f_samples = num_f_samples
-        self.likelihood_exponent = likelihood_exponent
-        self.stein_kernel, self.stein_kernel_derivative = prepare_stein_kernel()
-        self.domain = self.function_simulator.domain
-
-    def fsim_samples(
-        self, data_stacked: jnp.ndarray, key: jax.random.PRNGKey, data_stats: DataStats
-    ) -> jnp.ndarray:
-        random_key, subkey = random.split(key)
-
-        x_unnormalized = vmap(
-            lambda xi: self.normalizer.denormalize(xi, data_stats.inputs)
-        )(data_stacked)
-
-        f_prior = self.function_simulator.sample_function_vals(
-            x=x_unnormalized, num_samples=self.num_f_samples, rng_key=subkey
-        )
-
-        f_prior_normalized = vmap(
-            lambda fi: vmap(self.normalizer.normalize, in_axes=(0, None))(
-                fi, data_stats.outputs
-            )
-        )(f_prior)
-        return f_prior_normalized
-
-    def prior_log_prob_gp_approx(
-        self,
-        predictions: jnp.ndarray,
-        data_stacked: jnp.ndarray,
-        key: jax.random.PRNGKey,
-        data_stats: DataStats,
-        eps: float = 1e-4,
-    ) -> jnp.ndarray:
-
-        # calculate prior
-        f_samples = self.fsim_samples(data_stacked, key, data_stats)
-        f_mean = jnp.mean(f_samples, axis=0).T
-        f_cov = jnp.swapaxes(
-            tfp.stats.covariance(f_samples, sample_axis=0, event_axis=1), 0, -1
-        )
-        prior_gp_approx = tfd.MultivariateNormalFullCovariance(
-            loc=f_mean, covariance_matrix=f_cov + eps * jnp.eye(data_stacked.shape[0])
-        )
-        prior_logprob = jnp.sum(prior_gp_approx.log_prob(predictions.swapaxes(-1, -2)))
-
-        return prior_logprob
-
-    def _neg_log_posterior(
-        self,
-        predictions: jnp.ndarray,
-        data_stacked: jnp.ndarray,
-        input_till_idx: int,
-        outputs: jnp.ndarray,
-        num_train_points: Union[float, int],
-        key: jax.random.PRNGKey,
-        data_stats: DataStats,
-    ):
-        # calculate _neg_log_posterior for each particle
-        # predictions shape: (num_particles, len(data_stacked), 2*output_dim)
-
-        def _neg_log_posterior_single(predictions, data_stacked, key, data_stats):
-            # predictions shape: (len(data_stacked), 2*output_dim)
-
-            # split predictions
-            mu, log_sigma = jnp.split(predictions, 2, axis=-1)
-            sigma = nn.softplus(log_sigma)
-
-            # split pred_inputs
-            pred_inputs = predictions[:input_till_idx, :]
-            mu_inputs, log_sigma_inputs = jnp.split(pred_inputs, 2, axis=-1)
-            sigma_inputs = nn.softplus(log_sigma_inputs)
-
-            # calculate nll
-            nll = (
-                -num_train_points
-                * self.likelihood_exponent
-                * norm.logpdf(outputs, loc=mu_inputs, scale=sigma_inputs)
-            )
-
-            prior_logprob = self.prior_log_prob_gp_approx(
-                mu, data_stacked, key, data_stats
-            )
-
-            neg_log_post = nll.mean() - prior_logprob
-            return neg_log_post
-
-        neg_log_post_final = vmap(
-            _neg_log_posterior_single, in_axes=(0, None, None, None)
-        )(predictions, data_stacked, key, data_stats)
-
-        return jnp.mean(neg_log_post_final)
-
-    def loss(
-        self,
-        vmapped_params: PyTree,
-        inputs: chex.Array,
-        outputs: chex.Array,
-        data_stats: DataStats,
-    ) -> [jax.Array, Dict]:
-
-        # data points: input and measurement points
-        input_till_idx = inputs.shape[0]
-        measurement_points = self.domain.sample_uniformly(
-            key=random.PRNGKey(0), sample_shape=self.num_measurement_points
-        )
-        data_stacked = jnp.concatenate([inputs, measurement_points], axis=0)
-
-        # adapt "apply_train" to output model
-        def apply_fn(params: PyTree, x: jax.Array) -> jax.Array:
-            x = self.normalizer.normalize(x, data_stats.inputs)
-            out = self.model.apply({"params": params}, x)
-            return out
-
-        # setup vmap
-        apply_ensemble_one = vmap(apply_fn, in_axes=(0, None), out_axes=0)
-        apply_ensemble = vmap(
-            apply_ensemble_one, in_axes=(None, 0), out_axes=1, axis_name="batch"
-        )
-
-        # apply to get predictions
-        f_raw = apply_ensemble(vmapped_params, data_stacked)
-
         # split predictions to seperate input and measurement points
-        # f_raw_inputs = apply_ensemble_one(vmapped_params, inputs)
-        f_raw_inputs = f_raw[:, :input_till_idx, :]
-        mu_inputs, log_sigma_inputs = jnp.split(f_raw_inputs, 2, axis=-1)
-
-        # normalize target outputs
-        target_outputs_norm = vmap(self.normalizer.normalize, in_axes=(0, None))(
-            outputs, data_stats.outputs
-        )
-
-        def neg_log_likelihood(predictions, output):
-            mu, log_sigma = jnp.split(predictions, 2, axis=-1)
-            return (
-                self._neg_log_posterior(
-                    predictions,
-                    data_stacked,
-                    input_till_idx,
-                    output,
-                    len(inputs),
-                    random.PRNGKey(3),
-                    data_stats,
-                ),
-                mu,
-            )
-
-        # calculate nll and nll gradient of posterior
-        (negative_log_posterior, mu), grad_post = jax.value_and_grad(
-            neg_log_likelihood, argnums=0, has_aux=True
-        )(f_raw, target_outputs_norm)
+        mu_inputs = mu[:, :-self.num_measurement_points, :]
 
         # calculate mse
         mse = jnp.mean((mu_inputs - target_outputs_norm[None, ...]) ** 2)
+        return negative_log_posterior.mean(0), mse
 
-        # calculate kernel, kernel derivative and kernal gradient
-        k = self.stein_kernel(f_raw)
-        k_x = self.stein_kernel_derivative(f_raw)
-        grad_k = jnp.mean(k_x, axis=0)
-
-        # calculate surrogate loss (analog to FSVGD-Paper)
-        surrogate_loss = jnp.sum(
-            f_raw * jax.lax.stop_gradient(jnp.einsum("ij,jkm", k, grad_post) - grad_k)
+    @partial(jax.jit, static_argnums=0)
+    def step_jit(self,
+                 opt_state: optax.OptState,
+                 vmapped_params: chex.PRNGKey,
+                 inputs: chex.Array,
+                 outputs: chex.Array,
+                 data_stats: DataStats,
+                 key: jax.random.PRNGKey,
+                 num_data_points: int,
+                 ) -> (optax.OptState, PyTree, OrderedDict):
+        (loss, mse), grads = jax.value_and_grad(self.loss, has_aux=True)(
+            vmapped_params, inputs, outputs, data_stats, key, num_data_points,
         )
-        return surrogate_loss, mse
+        updates, opt_state = self.tx.update(grads, opt_state, vmapped_params)
+        vmapped_params = optax.apply_updates(vmapped_params, updates)
+        statiscs = OrderedDict(nll=loss, mse=mse)
+        return opt_state, vmapped_params, statiscs
 
+    def _train_model(self,
+                     num_training_steps: int,
+                     model_state: BNNState,
+                     data_stats: DataStats,
+                     train_data: Data,
+                     eval_data: Data,
+                     rng: jax.random.PRNGKey,
+                     ) -> BNNState:
+
+        vmapped_params = model_state.vmapped_params
+        opt_state = self.tx.init(vmapped_params)
+        # convert to numpy array which are cheaper for indexing
+        num_data_points = train_data.inputs.shape[0]
+        train_data = Data(inputs=np.asarray(train_data.inputs), outputs=np.asarray(train_data.outputs))
+        eval_data = Data(inputs=np.asarray(eval_data.inputs), outputs=np.asarray(eval_data.outputs))
+        best_statistics = OrderedDict(eval_nll=NO_EVAL_VALUE)
+        evaluated_model = False
+        best_params = vmapped_params
+        for train_step in range(num_training_steps):
+            data_rng, sim_rng, rng = jax.random.split(rng, 3)
+            data_batch = self.sample_batch(train_data, self.batch_size, data_rng)
+            opt_state, vmapped_params, statistics = self.step_jit(opt_state, vmapped_params, data_batch.inputs,
+                                                                  data_batch.outputs, data_stats, sim_rng,
+                                                                  num_data_points)
+            if train_step % self.evaluation_frequency == 0:
+                evaluated_model = True
+                eval_rng, rng = jax.random.split(rng, 2)
+                eval_data_batch = self.sample_batch(eval_data, self.eval_batch_size, eval_rng)
+                eval_statistics = self.evaluate_model(vmapped_params=vmapped_params, eval_data=eval_data_batch,
+                                                      data_stats=data_stats)
+                statistics.update(eval_statistics)
+                if best_statistics['eval_nll'] > statistics['eval_nll']:
+                    best_statistics = OrderedDict(eval_nll=statistics['eval_nll'])
+                    best_params = vmapped_params
+            if self.logging_wandb and train_step % self.logging_frequency == 0:
+                wandb.log(statistics)
+
+        if self.return_best_model and evaluated_model:
+            final_params = best_params
+        else:
+            final_params = vmapped_params
+
+        calibrate_alpha = jnp.ones(self.output_dim)
+        new_model_state = BNNState(data_stats=data_stats, vmapped_params=final_params,
+                                   calibration_alpha=calibrate_alpha)
+        return new_model_state
 
 if __name__ == "__main__":
     key = random.PRNGKey(0)
     logging_wandb = False
     test_simulator = True
     input_dim = 1
-    output_dim = 2
+    output_dim = 1
     sim = SinusoidsSim(input_size=input_dim, output_size=output_dim)
+    num_train_points = 2
+    num_test_points = 1000
 
-    noise_level = 0.1
+    noise_level = 0.001
     d_l, d_u = -5, 5
-    xs = jnp.linspace(d_l, d_u, 20).reshape(-1, 1)
+    xs = jnp.linspace(d_l, d_u, num_train_points + num_test_points).reshape(-1, 1)
     # ys = jnp.concatenate([jnp.sin(xs), jnp.cos(xs)], axis=1)
-    ys_co = sim.sample_function_vals(xs, num_samples=1, rng_key=key)
+    sample_key, key = jax.random.split(key, 2)
+    ys_co = sim.sample_function_vals(xs, num_samples=1, rng_key=sample_key)
     ys = jnp.squeeze(ys_co, axis=0)
-
-    ys = ys * (1 + noise_level * random.normal(key=random.PRNGKey(0), shape=ys.shape))
+    test_xs = xs
+    test_ys = ys
+    ys = ys + noise_level * random.normal(key=random.PRNGKey(0), shape=ys.shape)
+    test_ys_noisy = ys
     data_std = noise_level * jnp.ones(shape=(output_dim,))
+    data_sample_key, key = jax.random.split(key, 2)
+    indx = jax.random.randint(key=data_sample_key, shape=(num_train_points, ),
+                              minval=0, maxval=num_train_points + num_test_points)
+
+    xs, ys = xs[indx], ys[indx]
+
 
     data = Data(inputs=xs, outputs=ys)
 
@@ -450,16 +300,18 @@ if __name__ == "__main__":
     #     plt.savefig("sampled_functions.png")
 
     num_particles = 10
-    model = DeterministicSimFSVGDEnsemble(
+    model = SimPriorDeterministicEnsemble(
         input_dim=input_dim,
         output_dim=output_dim,
         features=[64, 64, 64],
         num_particles=num_particles,
-        num_f_samples=256,
+        num_f_samples=1024,
         eval_frequency=500,
         output_stds=data_std,
         logging_wandb=logging_wandb,
         function_simulator=sim,
+        batch_size=8,
+        num_measurement_points=32,
         # likelihood_std=0.05,
     )
     model_state = model.init(model.key)
@@ -472,24 +324,15 @@ if __name__ == "__main__":
         )
 
     model_state = model.fit_model(
-        data=data, num_training_steps=1000, model_state=model_state
+        data=data, num_training_steps=10_000, model_state=model_state
     )
     print(f"Training time: {time.time() - start_time:.2f} seconds")
 
-    test_xs = jnp.linspace(-3, 13, 1000).reshape(-1, 1)
-
-    # test_ys = jnp.concatenate([jnp.sin(test_xs), jnp.cos(test_xs)], axis=1)
-    test_ys_co = sim.sample_function_vals(test_xs, num_samples=1, rng_key=key)
-    test_ys = jnp.squeeze(test_ys_co, axis=0)
-
-    test_ys_noisy = test_ys * (
-        1 + noise_level * random.normal(key=random.PRNGKey(0), shape=test_ys.shape)
-    )
-
     test_stds = noise_level * jnp.ones(shape=test_ys.shape)
-
+    # test_xs = xs
+    # test_ys_noisy = ys
+    # test_ys = ys
     f_dist, y_dist = vmap(model.posterior, in_axes=(0, None))(test_xs, model_state)
-
     pred_mean = f_dist.mean()
     eps_std = f_dist.stddev()
     al_std = jnp.mean(y_dist.aleatoric_stds, axis=1)

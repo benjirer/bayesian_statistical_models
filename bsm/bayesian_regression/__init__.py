@@ -9,8 +9,7 @@ from bsm.bayesian_regression.bayesian_neural_networks import (
     DeterministicEnsemble,
     ProbabilisticFSVGDEnsemble,
     DeterministicFSVGDEnsemble,
-    DeterministicSimFSVGDEnsemble,
-    ProbabilisticSimFSVGDEnsemble,
+    SimPriorDeterministicEnsemble,
 )
 from bsm.bayesian_regression.bayesian_recurrent_neural_networks import (
     RNNState,
