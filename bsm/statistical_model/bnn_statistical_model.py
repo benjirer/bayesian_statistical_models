@@ -12,7 +12,7 @@ from bsm.bayesian_regression.bayesian_neural_networks.fsvgd_ensemble import (
     DeterministicFSVGDEnsemble,
     ProbabilisticFSVGDEnsemble,
 )
-from bsm.bayesian_regression.bayesian_neural_networks.sim_fsvgd import (
+from bsm.bayesian_regression.bayesian_neural_networks.sim_ensemble import (
     DeterministicSimFSVGDEnsemble,
     ProbabilisticSimFSVGDEnsemble,
 )

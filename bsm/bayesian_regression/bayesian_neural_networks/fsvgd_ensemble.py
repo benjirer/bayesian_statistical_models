@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
     noise_level = 0.1
     d_l, d_u = 0, 10
-    xs = jnp.linspace(d_l, d_u, 10).reshape(-1, 1)
+    xs = jnp.linspace(d_l, d_u, 15).reshape(-1, 1)
     ys = jnp.concatenate([jnp.sin(xs), jnp.cos(xs)], axis=1)
     ys = ys * (1 + noise_level * random.normal(key=random.PRNGKey(0), shape=ys.shape))
     data_std = noise_level * jnp.ones(shape=(output_dim,))
@@ -171,7 +171,7 @@ if __name__ == "__main__":
         )
 
     model_state = model.fit_model(
-        data=data, num_training_steps=1000, model_state=model_state
+        data=data, num_training_steps=100000, model_state=model_state
     )
     print(f"Training time: {time.time() - start_time:.2f} seconds")
 
