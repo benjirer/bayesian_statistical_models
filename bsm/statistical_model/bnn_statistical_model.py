@@ -12,10 +12,10 @@ from bsm.bayesian_regression.bayesian_neural_networks.fsvgd_ensemble import (
     DeterministicFSVGDEnsemble,
     ProbabilisticFSVGDEnsemble,
 )
-from bsm.bayesian_regression.bayesian_neural_networks.sim_fsvgd import (
-    DeterministicSimFSVGDEnsemble,
-    ProbabilisticSimFSVGDEnsemble,
-)
+# from bsm.bayesian_regression.bayesian_neural_networks.sim_fsvgd import (
+#     DeterministicSimFSVGDEnsemble,
+#     ProbabilisticSimFSVGDEnsemble,
+# )
 from bsm.bayesian_regression.bayesian_neural_networks.probabilistic_ensembles import (
     ProbabilisticEnsemble,
 )
@@ -53,18 +53,18 @@ class BNNStatisticalModel(StatisticalModel[BNNState]):
             model = ProbabilisticFSVGDEnsemble(
                 input_dim=input_dim, output_dim=output_dim, *args, **kwargs
             )
-        elif self.bnn_type == DeterministicSimFSVGDEnsemble(
-            input_dim=input_dim, output_dim=output_dim, *args, **kwargs
-        ):
-            model = DeterministicSimFSVGDEnsemble(
-                input_dim=input_dim, output_dim=output_dim, *args, **kwargs
-            )
-        elif self.bnn_type == ProbabilisticSimFSVGDEnsemble(
-            input_dim=input_dim, output_dim=output_dim, *args, **kwargs
-        ):
-            model = ProbabilisticSimFSVGDEnsemble(
-                input_dim=input_dim, output_dim=output_dim, *args, **kwargs
-            )
+        # elif self.bnn_type == DeterministicSimFSVGDEnsemble(
+        #     input_dim=input_dim, output_dim=output_dim, *args, **kwargs
+        # ):
+        #     model = DeterministicSimFSVGDEnsemble(
+        #         input_dim=input_dim, output_dim=output_dim, *args, **kwargs
+        #     )
+        # elif self.bnn_type == ProbabilisticSimFSVGDEnsemble(
+        #     input_dim=input_dim, output_dim=output_dim, *args, **kwargs
+        # ):
+        #     model = ProbabilisticSimFSVGDEnsemble(
+        #         input_dim=input_dim, output_dim=output_dim, *args, **kwargs
+        #     )
         else:
             raise NotImplementedError(f"Unknown BNN type: {self.bnn_type}")
         super().__init__(input_dim, output_dim, model)
